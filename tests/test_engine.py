@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 tests/test_engine.py
-Scope: Behavioral and regression test suite for GtmStateEngine (V-03 / G-03).
+Scope: Unit, zero-row regression, and real PostgreSQL advisory-lock + state persistence tests for GtmStateEngine.
 """
 
 import os
@@ -131,3 +131,59 @@ def test_database_error_rolls_back_and_returns_false(mock_connect):
     assert mock_conn.rolled_back is True
     assert mock_conn.committed is False
     assert mock_conn.closed is True
+
+
+@pytest.mark.skipif(not os.environ.get("TEST_PG_DSN"), reason="TEST_PG_DSN not set for live PostgreSQL integration")
+def test_postgres_integration_state_persistence_and_advisory_lock_contention():
+    """
+    Real PostgreSQL integration test exercising:
+      1. Valid transition persists state change in funnel_runs (returns True)
+      2. Stale current_state or missing run_id does not modify row and returns False
+      3. Advisory lock contention across two independent connections blocks second caller (returns False)
+      4. Releasing the first transaction's lock allows the subsequent transition to succeed (returns True)
+    """
+    dsn = os.environ["TEST_PG_DSN"]
+    run_id = f"run_{uuid.uuid4().hex[:10]}"
+    scenario_id = f"scen_{uuid.uuid4().hex[:8]}"
+
+    admin_conn = psycopg2.connect(dsn)
+    admin_conn.autocommit = True
+    try:
+        with admin_conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS funnel_runs (
+                    id VARCHAR(128) PRIMARY KEY,
+                    state VARCHAR(32) NOT NULL,
+                    locked_at TIMESTAMPTZ
+                );
+            """)
+            cur.execute("INSERT INTO funnel_runs (id, state) VALUES (%s, 'idle');", (run_id,))
+
+        engine = GtmStateEngine(dsn=dsn)
+
+        # 1. Missing run_id -> 0 rows updated -> False
+        assert engine.advance_state("nonexistent_run", scenario_id, "idle", "observing") is False
+
+        # 2. Stale current_state -> 0 rows updated -> False
+        assert engine.advance_state(run_id, scenario_id, "observing", "interacting") is False
+
+        # 3. Valid transition idle -> observing -> True & persisted
+        assert engine.advance_state(run_id, scenario_id, "idle", "observing") is True
+        with admin_conn.cursor() as cur:
+            cur.execute("SELECT state FROM funnel_runs WHERE id = %s;", (run_id,))
+            assert cur.fetchone()[0] == "observing"
+
+        # 4. Advisory lock contention across independent connections:
+        # Hold the advisory lock inside engine.transaction_lock in connection 1 while connection 2 attempts advance_state
+        with engine.transaction_lock(f"funnel:{scenario_id}"):
+            assert engine.advance_state(run_id, scenario_id, "observing", "interacting") is False
+
+        # 5. Once the context manager exits and releases the advisory lock, transition succeeds
+        assert engine.advance_state(run_id, scenario_id, "observing", "interacting") is True
+        with admin_conn.cursor() as cur:
+            cur.execute("SELECT state FROM funnel_runs WHERE id = %s;", (run_id,))
+            assert cur.fetchone()[0] == "interacting"
+    finally:
+        with admin_conn.cursor() as cur:
+            cur.execute("DELETE FROM funnel_runs WHERE id = %s;", (run_id,))
+        admin_conn.close()

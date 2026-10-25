@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "multi-agent-gtm-state-engine"
+version = "1.0.0"
+description = "Deterministic GTM workflow state machine with PostgreSQL advisory locks."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "psycopg2-binary>=2.9.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

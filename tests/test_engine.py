@@ -187,3 +187,35 @@ def test_postgres_integration_state_persistence_and_advisory_lock_contention():
         with admin_conn.cursor() as cur:
             cur.execute("DELETE FROM funnel_runs WHERE id = %s;", (run_id,))
         admin_conn.close()
+
+
+@pytest.mark.skipif(not os.environ.get("TEST_PG_DSN"), reason="TEST_PG_DSN not set for live PostgreSQL integration")
+def test_postgres_integration_advisory_lock_release_after_rollback():
+    """
+    Step 2A (V-04 / G-04): Verifies that when transaction_lock() exits through a controlled
+    exception and rolls back, the PostgreSQL advisory transaction lock is released so an
+    independent connection can acquire the same lock afterward, and the failed transaction's
+    cursor and connection are cleaned up.
+    """
+    dsn = os.environ["TEST_PG_DSN"]
+    engine = GtmStateEngine(dsn=dsn)
+    lock_key = f"funnel:rollback_{uuid.uuid4().hex[:8]}"
+    captured_cursor = None
+
+    with pytest.raises(RuntimeError, match="controlled_rollback_trigger"):
+        with engine.transaction_lock(lock_key) as cursor1:
+            captured_cursor = cursor1
+            # Contention check while lock is held
+            with pytest.raises(BlockingIOError):
+                with engine.transaction_lock(lock_key):
+                    pass
+            raise RuntimeError("controlled_rollback_trigger")
+
+    assert captured_cursor is not None
+    assert captured_cursor.closed is True
+    assert captured_cursor.connection.closed != 0
+
+    # Independent connection must now succeed in acquiring the same advisory lock
+    with engine.transaction_lock(lock_key) as cursor2:
+        cursor2.execute("SELECT 1;")
+        assert cursor2.fetchone()[0] == 1
